@@ -1,0 +1,225 @@
+-- Project Delta Silent Aim (Network + Metamethod + Return Value Spoofing)
+local Players = game:GetService("Players")
+local RunService = game:GetService("RunService")
+local ReplicatedStorage = game:GetService("ReplicatedStorage")
+local Workspace = game:GetService("Workspace")
+
+local LocalPlayer = Players.LocalPlayer
+local Camera = Workspace.CurrentCamera
+
+local Remotes = ReplicatedStorage:WaitForChild("Remotes")
+local FireProjectile = Remotes:WaitForChild("FireProjectile")
+local VisualProjectile = Remotes:WaitForChild("VisualProjectile")
+local ProjectileInflict = Remotes:WaitForChild("ProjectileInflict")
+local AmmoTypes = ReplicatedStorage:WaitForChild("AmmoTypes")
+
+local BulletModule = require(ReplicatedStorage.Modules.FPS.Bullet)
+local FuncLibExt = require(ReplicatedStorage.Modules.FunctionLibraryExtension)
+
+-- Config
+local Config = {
+    Enabled = true,
+    FOVRadius = 600,
+    TargetPart = "Head",
+    BulletGravity = 70, -- Project Delta hardcoded drop: Vector3.new(0, -70, 0)
+    Prediction = true
+}
+
+local State = {
+    Target = nil,
+    TargetPart = nil,
+    AimDirection = nil,
+    LastAmmoType = nil
+}
+
+-- Drawing Objects (FOV Center & Target Line)
+local FOVCircle = Drawing.new("Circle")
+FOVCircle.Visible = true
+FOVCircle.Radius = Config.FOVRadius
+FOVCircle.Color = Color3.fromRGB(255, 255, 255)
+FOVCircle.Thickness = 1.5
+FOVCircle.Filled = false
+FOVCircle.NumSides = 64
+
+local TargetLine = Drawing.new("Line")
+TargetLine.Visible = false
+TargetLine.Color = Color3.fromRGB(255, 50, 50)
+TargetLine.Thickness = 1.5
+
+-- Active Weapon Muzzle Velocity Resolver
+local function GetCurrentMuzzleVelocity()
+    if State.LastAmmoType then
+        local ammo = AmmoTypes:FindFirstChild(State.LastAmmoType)
+        if ammo and ammo:GetAttribute("MuzzleVelocity") then
+            return ammo:GetAttribute("MuzzleVelocity")
+        end
+    end
+    local rsPlayer = ReplicatedStorage.Players:FindFirstChild(LocalPlayer.Name)
+    if rsPlayer then
+        local eq = rsPlayer.Status.GameplayVariables.EquippedTool.Value
+        if eq then
+            local mag = eq:FindFirstChild("Attachments") and eq.Attachments:FindFirstChild("Magazine")
+            local loaded = (mag and mag:FindFirstChild("LoadedAmmo")) or eq:FindFirstChild("LoadedAmmo")
+            if loaded then
+                local children = loaded:GetChildren()
+                if #children > 0 then
+                    local ammoName = children[#children]:GetAttribute("AmmoType")
+                    local ammo = ammoName and AmmoTypes:FindFirstChild(ammoName)
+                    if ammo and ammo:GetAttribute("MuzzleVelocity") then
+                        return ammo:GetAttribute("MuzzleVelocity")
+                    end
+                end
+            end
+        end
+    end
+    return 2400
+end
+
+-- Ballistic Trajectory & Prediction Solver
+local function CalculateSpoofedDirection(origin, targetPart)
+    local targetPos = targetPart.Position
+    if Config.Prediction then
+        local speed = GetCurrentMuzzleVelocity()
+        local dist = (targetPos - origin).Magnitude
+        local timeToHit = dist / speed
+        local vel = targetPart.AssemblyLinearVelocity or Vector3.zero
+        local drop = 0.5 * Config.BulletGravity * (timeToHit ^ 2)
+        targetPos = targetPos + (vel * timeToHit) + Vector3.new(0, drop, 0)
+    end
+    return (targetPos - origin).Unit
+end
+
+-- Target Acquisition (FOV Center)
+local function GetClosestTargetInFOV()
+    local screenCenter = Camera.ViewportSize / 2
+    local closestDist = Config.FOVRadius
+    local bestPlayer, bestPart = nil, nil
+
+    for _, player in ipairs(Players:GetPlayers()) do
+        if player ~= LocalPlayer and player.Character then
+            local char = player.Character
+            local hum = char:FindFirstChildOfClass("Humanoid")
+            local part = char:FindFirstChild(Config.TargetPart) or char:FindFirstChild("UpperTorso") or char:FindFirstChild("HumanoidRootPart")
+            if hum and hum.Health > 0 and part then
+                local screenPos, onScreen = Camera:WorldToViewportPoint(part.Position)
+                if onScreen then
+                    local dist = (Vector2.new(screenPos.X, screenPos.Y) - screenCenter).Magnitude
+                    if dist <= closestDist then
+                        closestDist = dist
+                        bestPlayer = player
+                        bestPart = part
+                    end
+                end
+            end
+        end
+    end
+    return bestPlayer, bestPart
+end
+
+
+local OldGetCamPos
+OldGetCamPos = hookfunction(FuncLibExt.GetEstimatedCameraPosition, newcclosure(function(self, player, ...)
+    local ret = OldGetCamPos(self, player, ...)
+    if not checkcaller() and Config.Enabled and player == LocalPlayer and State.TargetPart then
+        State.AimDirection = CalculateSpoofedDirection(ret, State.TargetPart)
+    end
+    return ret
+end))
+
+-- 2. Hook Point & Argument Spoofing: Bullet.CreateBullet
+local OldCreateBullet
+OldCreateBullet = hookfunction(BulletModule.CreateBullet, newcclosure(function(self, weapon, worldModel, viewModel, aimPart, stance, ammoType, lastUse, recoilPos, ...)
+    if not checkcaller() and Config.Enabled and State.TargetPart and aimPart then
+        State.LastAmmoType = ammoType
+        local origin = FuncLibExt:GetEstimatedCameraPosition(LocalPlayer)
+        local spoofDir = CalculateSpoofedDirection(origin, State.TargetPart)
+        State.AimDirection = spoofDir
+
+        -- Proxy aimPart table for return value spoofing on aimPart.CFrame.LookVector
+        local fakeAimPart = setmetatable({}, {
+            __index = function(_, k)
+                if k == "CFrame" then
+                    return CFrame.lookAt(aimPart.Position, aimPart.Position + spoofDir)
+                end
+                return aimPart[k]
+            end
+        })
+        return OldCreateBullet(self, weapon, worldModel, viewModel, fakeAimPart, stance, ammoType, lastUse, recoilPos, ...)
+    end
+    return OldCreateBullet(self, weapon, worldModel, viewModel, aimPart, stance, ammoType, lastUse, recoilPos, ...)
+end))
+
+
+local OldNamecall
+OldNamecall = hookmetamethod(game, "__namecall", newcclosure(function(self, ...)
+    local method = getnamecallmethod()
+    if not checkcaller() then
+        -- FireProjectile (InvokeServer): args = (direction: Vector3, id: number, timestamp: number)
+        if self == FireProjectile and method == "InvokeServer" then
+            if Config.Enabled and State.TargetPart then
+                local args = { ... }
+                local origin = Camera.CFrame.Position
+                args[1] = State.AimDirection or CalculateSpoofedDirection(origin, State.TargetPart)
+                return OldNamecall(self, unpack(args))
+            end
+
+
+        elseif self == VisualProjectile and method == "FireServer" then
+            if Config.Enabled and State.TargetPart then
+                local args = { ... }
+                local origin = Camera.CFrame.Position
+                args[1] = State.AimDirection or CalculateSpoofedDirection(origin, State.TargetPart)
+                return OldNamecall(self, unpack(args))
+            end
+
+        -- ProjectileInflict (FireServer): args = (hitPart: BasePart, hitOffset: CFrame, id: number, timestamp: number, extra: any)
+        elseif self == ProjectileInflict and method == "FireServer" then
+            local args = { ... }
+            -- Block CharacterController AC ban packets (codes 102-113 send CFrame.new(1,1,1) and small integer ID)
+            if typeof(args[2]) == "CFrame" and args[2].Position == Vector3.new(1, 1, 1) and type(args[3]) == "number" and args[3] >= 100 and args[3] <= 120 then
+                return
+            end
+            -- Spoof hit part & object-space offset if needed
+            if Config.Enabled and State.TargetPart then
+                args[1] = State.TargetPart
+                args[2] = CFrame.new(0, 0, 0)
+                return OldNamecall(self, unpack(args))
+            end
+        end
+    end
+    return OldNamecall(self, ...)
+end))
+
+-- Render Loop (FOV Center + Target Line)
+RunService.RenderStepped:Connect(function()
+    local screenCenter = Camera.ViewportSize / 2
+    FOVCircle.Position = screenCenter
+    FOVCircle.Radius = Config.FOVRadius
+    FOVCircle.Visible = Config.Enabled
+
+    if not Config.Enabled then
+        TargetLine.Visible = false
+        State.Target = nil
+        State.TargetPart = nil
+        State.AimDirection = nil
+        return
+    end
+
+    local target, part = GetClosestTargetInFOV()
+    State.Target = target
+    State.TargetPart = part
+
+    if part then
+        local screenPos, onScreen = Camera:WorldToViewportPoint(part.Position)
+        if onScreen then
+            TargetLine.From = screenCenter
+            TargetLine.To = Vector2.new(screenPos.X, screenPos.Y)
+            TargetLine.Visible = true
+        else
+            TargetLine.Visible = false
+        end
+    else
+        TargetLine.Visible = false
+        State.AimDirection = nil
+    end
+end)
